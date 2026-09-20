@@ -30,6 +30,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
 13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**不落库**的候选观测与正数 `impact_limit`，沿用现有异常判定算出候选偏差，预演插入对当前分段线性偏差曲线的影响。仅在候选时点两侧都已有观测时预演（候选时点已占用或无法形成双侧邻点均返回 409）：插入只会把左右最近观测之间的区间重新分段，受影响范围即 `[prev, next]`；曲线变化量 Δ 是折点 `(prev, 0) → (候选, Δc) → (next, 0)` 的分段线性函数，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，以及 `|Δ| > impact_limit` 的连续区间（阈值交点解析求解，恰等于阈值的瞬时不计入，不做固定步长采样）。请求**只读**，不改写观测、修订历史或区间表。
 14. **校正回执与密钥轮换**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并以键环当前活跃键签发 `version=2` 的 HMAC 回执：返回 `version`、`key_id`（签发密钥 ID）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，以 `CORRECTION_RECEIPT_KEYS` 键环中 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，按 `key_id` **精确选键**重算签名并以**常量时间**比较：任一签名字段被改动、或 `key_id` 未知/已轮换出环均返回 `{"valid": false}`（旧键保留在环内时，轮换前签发的回执仍可验证）；结构缺失或类型错误返回 422。历史 `version=1` 回执继续按旧规则校验（密钥取自 `CORRECTION_RECEIPT_SECRET`，载荷不含 `key_id`）。键环在启动时校验：空键环、未知活跃键、非法 `key_id` 一律拒绝启动。
+15. **校准排期规划**：`POST /calibration-schedules/plan` 在 `[from, to]` 窗口内规划**数量最少**的新增校准时点。固定锚点取窗口两侧能覆盖边界的现有观测（`from` 之前最近一次、`to` 之后最近一次，恰落在边界上的观测自然入选）与窗口内全部观测；在禁排时段之外插入最少的新增时点，使所有相邻锚点（含新增时点）的间隔都不超过 `max_gap`。禁排时段先**规范化合并**（丢弃空区间、排序、合并重叠或端点相接的区间），合并后区间的**开区间内部**禁止排期、**边界允许排期**；多个最少方案并列时返回**字典序最早**的一组。响应含规范化后的禁排时段、固定锚点、建议时点与逐段间隔。请求**只读**，不改写观测、修订历史或区间表；缺少覆盖边界的现有锚点或约束无解返回 409，`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 400。
 
 ## API 一览
 
@@ -49,6 +50,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/drift-exceedances` | 解析求解偏差越出 ±limit 的连续区间（方向/持续秒数/峰值） |
 | GET | `/drift-budget-depletion` | 解析求解漂移预算（\|bias\|·秒）首次耗尽的精确时点 |
 | GET | `/drift-stability-window` | 解析求解 max(bias) − min(bias) ≤ max_spread 的最长连续稳定子区间 |
+| POST | `/calibration-schedules/plan` | 规划窗口内数量最少的新增校准时点（禁排之外、相邻间隔 ≤ max_gap、字典序最早；只读） |
 | GET | `/health` | 健康检查 |
 
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
@@ -427,13 +429,63 @@ curl "http://localhost:8000/drift-stability-window?from=2026-09-18T08:00:00Z&to=
 
 `min_bias`/`max_bias` 为窗口内实际达到的极值（可能小于 `max_spread` 所允许的带宽）；`from ≥ to`、`max_spread ≤ 0` 或窗口边界越出覆盖范围均返回 400。
 
+### 校准排期规划
+
+`POST /calibration-schedules/plan` 回答“在 `[from, to]` 窗口内至少还要安排几次校准、各在什么时刻”，请求**只读**，不改写观测、修订历史或区间表。请求体含 `from`、`to`、`max_gap`（正数，秒）与可选 `blackout` 禁排时段数组：
+
+- **固定锚点**：`from` 之前最近一次观测、`to` 之后最近一次观测（覆盖窗口边界，恰落在边界上的观测自然入选）与窗口内全部观测。
+- **禁排规范化**：禁排时段先丢弃空区间（`from == to`）、排序并合并一切重叠或端点相接的区间；合并后区间的**开区间内部**禁止排期，**边界允许排期**（相接两段合并后，原相接点成为内部、同样禁止）。
+- **最少时点**：在禁排之外插入数量最少的新增时点，使所有相邻锚点（含新增时点）的间隔都不超过 `max_gap`；多个最少方案并列时返回**字典序最早**的一组（先让第一个时点尽量早，依次类推）。
+
+响应含规范化后的禁排时段、固定锚点（观测 ID 与时点）、建议时点，以及固定锚点与建议时点合并排序后的逐段间隔（`duration_seconds` 均不超过 `max_gap`，端点以 `start_kind`/`end_kind` 区分 `fixed`/`suggested`）。
+
+沿用 08:00、12:00 两条观测的场景，规划 08:00–12:00 窗口（`max_gap` 2 小时，09:30–10:30 禁排）：
+
+```bash
+curl -X POST http://localhost:8000/calibration-schedules/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "2026-09-18T08:00:00Z", "to": "2026-09-18T12:00:00Z",
+       "max_gap": 7200,
+       "blackout": [{"from": "2026-09-18T09:30:00Z", "to": "2026-09-18T10:30:00Z"}]}'
+```
+
+```json
+{
+  "from": 1789718400.0, "from_iso": "2026-09-18T08:00:00+00:00",
+  "to": 1789732800.0, "to_iso": "2026-09-18T12:00:00+00:00",
+  "max_gap": 7200.0,
+  "blackout": [
+    {"from": 1789723800.0, "from_iso": "2026-09-18T09:30:00+00:00",
+     "to": 1789727400.0, "to_iso": "2026-09-18T10:30:00+00:00"}
+  ],
+  "fixed_anchors": [
+    {"observation_id": 1, "timestamp": 1789718400.0, "timestamp_iso": "2026-09-18T08:00:00+00:00"},
+    {"observation_id": 2, "timestamp": 1789732800.0, "timestamp_iso": "2026-09-18T12:00:00+00:00"}
+  ],
+  "suggested": [
+    {"timestamp": 1789720200.0, "timestamp_iso": "2026-09-18T08:30:00+00:00"},
+    {"timestamp": 1789727400.0, "timestamp_iso": "2026-09-18T10:30:00+00:00"}
+  ],
+  "segments": [
+    {"t_start": 1789718400.0, "t_end": 1789720200.0, "duration_seconds": 1800.0,
+     "start_kind": "fixed", "end_kind": "suggested", "...": "..."},
+    {"t_start": 1789720200.0, "t_end": 1789727400.0, "duration_seconds": 7200.0,
+     "start_kind": "suggested", "end_kind": "suggested", "...": "..."},
+    {"t_start": 1789727400.0, "t_end": 1789732800.0, "duration_seconds": 5400.0,
+     "start_kind": "suggested", "end_kind": "fixed", "...": "..."}
+  ]
+}
+```
+
+无禁排时本例只需 1 个时点（10:00），但它落在禁排开区间 (09:30, 10:30) 内，故最少方案为 2 个时点（08:30 与禁排边界 10:30）。缺少覆盖边界的现有锚点（`from` 之前或 `to` 之后无任何观测）或约束无解（禁排封死所有可行位置，例如禁排段比 `max_gap` 还宽）返回 **409**；`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 **400**。
+
 ### 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0` |
+| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；排期规划 `from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
-| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点 |
+| 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点；排期规划缺少覆盖边界的现有锚点或禁排约束下无解 |
 | 422 | 读数不足 3 次、全部读数被判异常、参数非法；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
 
 ## 本地开发
@@ -464,14 +516,16 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演
+  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演、校准排期规划
   receipts.py     # 校正回执：复用漂移补偿、版本化 HMAC-SHA256 签名与常量时间校验（兼容 v1）
   receipt_keys.py # 回执密钥轮换：键环解析、key_id 校验、活跃键选择、启动时校验
-  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解、插入影响解析比较
+  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解、插入影响解析比较、排期规划（禁排合并与最少时点求解）
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表
 tests/test_api.py                 # 端到端 API 测试
 tests/test_correction_receipts.py # 校正回执签发/校验/密钥轮换/v1 兼容端到端测试
 tests/test_receipt_keys.py        # 键环加载与启动校验测试
+tests/test_schedule_plan.py       # 排期规划纯算法单测（禁排合并、最少时点、字典序最早、无解判定）
+tests/test_schedule_plan_api.py   # 排期规划 API 端到端测试（锚点选择、禁排边界、409/400、只读）
 Dockerfile / docker-compose.yml
 ```

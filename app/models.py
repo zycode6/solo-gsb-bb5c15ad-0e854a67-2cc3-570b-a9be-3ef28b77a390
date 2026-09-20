@@ -62,6 +62,21 @@ class ObservationImpactPreviewIn(ObservationIn):
     impact_limit: float = Field(description="影响阈值（正数）：|偏差变化| 严格大于该值才计入影响区间")
 
 
+class BlackoutIntervalIn(BaseModel):
+    from_: Timestamp = Field(alias="from", description="禁排时段起点：Unix 秒或 ISO 8601")
+    to: Timestamp = Field(description="禁排时段终点：Unix 秒或 ISO 8601")
+
+
+class CalibrationSchedulePlanIn(BaseModel):
+    from_: Timestamp = Field(alias="from", description="规划窗口下界：Unix 秒或 ISO 8601")
+    to: Timestamp = Field(description="规划窗口上界：Unix 秒或 ISO 8601")
+    max_gap: float = Field(description="相邻锚点允许的最大间隔（正数，秒）")
+    blackout: list[BlackoutIntervalIn] = Field(
+        default_factory=list,
+        description="禁排时段（可选）：先规范化合并，其开区间内部禁止排期，边界允许",
+    )
+
+
 # ---------- 响应 ----------
 
 class ReadingOut(BaseModel):
@@ -251,4 +266,52 @@ class ObservationImpactPreviewOut(BaseModel):
     max_change_at_iso: str
     impact_intervals: list[ImpactIntervalOut] = Field(
         description="|偏差变化| > impact_limit 的连续区间，按时间排序；阈值交点解析求解"
+    )
+
+
+class BlackoutIntervalOut(BaseModel):
+    from_: float = Field(alias="from", description="规范化合并后的禁排时段起点（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="规范化合并后的禁排时段终点（Unix 秒）")
+    to_iso: str
+
+
+class ScheduleAnchorOut(BaseModel):
+    observation_id: int = Field(description="锚点对应的观测 ID")
+    timestamp: float = Field(description="锚点时点（Unix 秒）")
+    timestamp_iso: str
+
+
+class SuggestedPointOut(BaseModel):
+    timestamp: float = Field(description="建议新增校准时点（Unix 秒）")
+    timestamp_iso: str
+
+
+class ScheduleSegmentOut(BaseModel):
+    t_start: float = Field(description="分段起点（Unix 秒）")
+    t_end: float = Field(description="分段终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+    duration_seconds: float = Field(description="分段间隔秒数（t_end − t_start），不超过 max_gap")
+    start_kind: str = Field(description="起点类型：fixed = 固定锚点；suggested = 建议时点")
+    end_kind: str = Field(description="终点类型：fixed = 固定锚点；suggested = 建议时点")
+
+
+class CalibrationSchedulePlanOut(BaseModel):
+    from_: float = Field(alias="from", description="规划窗口下界（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="规划窗口上界（Unix 秒）")
+    to_iso: str
+    max_gap: float = Field(description="相邻锚点允许的最大间隔（正数，秒）")
+    blackout: list[BlackoutIntervalOut] = Field(
+        description="规范化合并后的禁排时段：其开区间内部禁止排期，边界允许"
+    )
+    fixed_anchors: list[ScheduleAnchorOut] = Field(
+        description="固定锚点：窗口两侧能覆盖边界的现有观测及窗口内观测，按时间排序"
+    )
+    suggested: list[SuggestedPointOut] = Field(
+        description="建议新增校准时点：数量最少，多个最少方案并列时取字典序最早的一组"
+    )
+    segments: list[ScheduleSegmentOut] = Field(
+        description="固定锚点与建议时点合并排序后的逐段间隔，按时间排序"
     )

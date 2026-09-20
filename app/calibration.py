@@ -1,4 +1,4 @@
-"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解、预算累积反解与稳定窗口求解。不触碰数据库，便于单测。"""
+"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解、预算累积反解、稳定窗口求解与校准排期规划。不触碰数据库，便于单测。"""
 from __future__ import annotations
 
 import math
@@ -255,3 +255,98 @@ def stability_window(points: list[tuple[float, float]], spread: float) -> tuple[
     extrema = [_value_at(points, s), _value_at(points, e)]
     extrema += [b for t, b in points if s < t < e]
     return s, e, min(extrema), max(extrema)
+
+
+# ---------- 校准排期规划（最少新增时点） ----------
+
+def merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """把禁排区间规范化为互不重叠、互不相接的升序区间列表。
+
+    丢弃空区间（s >= e），按起点排序后合并一切重叠或端点相接（s 恰等于前一区间
+    终点）的区间。相接区间合并后原相接点成为合并区间的内部——排期时只有合并后
+    区间的端点允许排期。
+    """
+    spans = sorted((s, e) for s, e in intervals if s < e)
+    merged: list[list[float]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _min_allowed_at_or_after(x: float, end: float, blackout: list[tuple[float, float]]) -> float | None:
+    """返回 [x, end) 内最小允许排期的位置；不存在返回 None。
+
+    blackout 为已规范化（merge_intervals）的禁排区间：禁排的是开区间 (s, e)，
+    边界 s/e 允许排期。
+    """
+    p = x
+    for s, e in blackout:
+        if s >= end:
+            break            # 区间已排序，之后的区间更不可能落在 end 内
+        if e <= p:
+            continue         # 该区间整体在 p 左侧
+        if p <= s:
+            return p         # p 在区间左边界上或其外：允许（边界允许排期）
+        if p < e:
+            p = e            # p 落在 (s, e) 内：跳到右边界（边界允许排期）
+    return p if p < end else None
+
+
+def _plan_gap_points(
+    start: float, end: float, max_gap: float, blackout: list[tuple[float, float]]
+) -> list[float] | None:
+    """在 (start, end) 内生成数量最少、字典序最早的新增时点，使相邻间隔 ≤ max_gap。
+
+    新增时点不得落在任何（已合并）禁排区间的开区间内部，边界允许；无解返回 None。
+
+    两阶段构造：
+    1. 自右向左推阈值 th[j] = 至多再用 j 个时点即可到达 end 的最小当前位置：
+       th[0] = end − max_gap，th[j+1] = min(th[j], q − max_gap)，其中 q 为
+       [th[j], end) 内最小可排期位置。阈值不再下降时若仍大于 start 则无解；
+       首次 th[k] ≤ start 时的 k 即最少新增点数。
+    2. 自左向右逐点取“仍能用剩余点数完成”的最早位置：第 i 个点取
+       [th[k−i], 当前位置 + max_gap] 内最小可排期位置，即字典序最早方案。
+    """
+    if end - start <= max_gap:
+        return []
+    th = [end - max_gap]
+    while th[-1] > start:
+        q = _min_allowed_at_or_after(th[-1], end, blackout)
+        if q is None:
+            return None
+        nxt = min(th[-1], q - max_gap)
+        if nxt == th[-1]:
+            return None    # 阈值不再下降：start 左侧无可继续推进的排期位置
+        th.append(nxt)
+    points = []
+    cur = start
+    for j in range(len(th) - 1, 0, -1):
+        p = _min_allowed_at_or_after(th[j - 1], end, blackout)
+        if p is None or p > cur + max_gap:
+            return None    # 阈值阶段已保证可行，此处仅为防御
+        points.append(p)
+        cur = p
+    return points
+
+
+def plan_calibrations(
+    anchors: list[float], max_gap: float, blackout: list[tuple[float, float]]
+) -> list[float] | None:
+    """在固定锚点之间插入数量最少的新增校准时点，使所有相邻时点间隔 ≤ max_gap。
+
+    anchors 为升序固定锚点；blackout 为禁排区间（内部先经 merge_intervals 规范化
+    合并），新增时点不得落在合并后区间的开区间内部（边界允许排期）。各相邻锚点间
+    相互独立，分别求解后按时间拼接即全局最少且字典序最早的方案；任一段无解时
+    整体返回 None。
+    """
+    merged = merge_intervals(blackout)
+    suggested: list[float] = []
+    for a, b in zip(anchors, anchors[1:]):
+        points = _plan_gap_points(a, b, max_gap, merged)
+        if points is None:
+            return None
+        suggested.extend(points)
+    return suggested

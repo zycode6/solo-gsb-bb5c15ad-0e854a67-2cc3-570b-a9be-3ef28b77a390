@@ -12,6 +12,8 @@ from .calibration import CalibrationError
 from .db import init_db
 from .receipt_keys import load_key_ring
 from .models import (
+    CalibrationSchedulePlanIn,
+    CalibrationSchedulePlanOut,
     CorrectionIn,
     CorrectionOut,
     DriftBudgetDepletionOut,
@@ -36,14 +38,17 @@ from .receipts import (
 )
 from .service import (
     DuplicateTimestampError,
+    InsufficientAnchorsError,
     InsufficientNeighborsError,
     InvalidBudgetError,
     InvalidLimitError,
+    InvalidMaxGapError,
     InvalidSpreadError,
     InvalidWindowError,
     ObservationNotFoundError,
     OutOfCoverageError,
     RevisionConflictError,
+    ScheduleInfeasibleError,
 )
 
 
@@ -57,7 +62,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Instrument Calibration Drift Compensation API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交参考值与同一时点至少 3 次读数，服务标记异常读数并计算校准偏差；"
         "在相邻观测时点间线性插值偏差，对待校正读数施加补偿。"
@@ -272,6 +277,30 @@ def get_drift_budget_depletion(
         return service.drift_budget_depletion(frm=from_, budget=budget)
     except (InvalidBudgetError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/calibration-schedules/plan", response_model=CalibrationSchedulePlanOut)
+def post_calibration_schedule_plan(payload: CalibrationSchedulePlanIn) -> dict:
+    """规划窗口内数量最少的新增校准时点；只读，不写观测、修订历史或区间表。
+
+    固定锚点为窗口两侧能覆盖边界的现有观测（from 之前最近一次、to 之后最近一次）
+    及窗口内全部观测；禁排时段先规范化合并（其开区间内部禁止排期，边界允许），
+    在禁排之外生成数量最少的新增时点，保证相邻锚点间隔不超过 max_gap；多个最少
+    方案并列时返回字典序最早的一组。响应含固定锚点、建议时点与逐段间隔。
+    缺少覆盖边界的现有锚点或约束无解返回 409；from ≥ to、max_gap ≤ 0 或禁排区间
+    from > to 返回 400。
+    """
+    try:
+        return service.plan_calibration_schedule(
+            frm=payload.from_,
+            to=payload.to,
+            max_gap=payload.max_gap,
+            blackout=[(b.from_, b.to) for b in payload.blackout],
+        )
+    except (InvalidWindowError, InvalidMaxGapError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (InsufficientAnchorsError, ScheduleInfeasibleError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/drift-stability-window", response_model=DriftStabilityWindowOut)

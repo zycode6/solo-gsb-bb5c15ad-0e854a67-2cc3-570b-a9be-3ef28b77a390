@@ -58,6 +58,18 @@ class InsufficientNeighborsError(Exception):
     """候选时点两侧无法同时找到已有观测，无法形成插入预演所需的双侧邻点。"""
 
 
+class InvalidMaxGapError(Exception):
+    """相邻锚点允许的最大间隔不是正数。"""
+
+
+class InsufficientAnchorsError(Exception):
+    """窗口两侧缺少能覆盖边界的现有观测锚点。"""
+
+
+class ScheduleInfeasibleError(Exception):
+    """禁排约束下无法排出满足最大间隔的校准时点。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -795,4 +807,87 @@ def observation_impact_preview(
             }
             for s, e in exceedances
         ],
+    }
+
+
+# ---------- 校准排期规划 ----------
+
+def plan_calibration_schedule(
+    frm: float, to: float, max_gap: float, blackout: list[tuple[float, float]]
+) -> dict:
+    """规划 [frm, to] 窗口内的新增校准时点；只读，不写观测、修订历史或区间表。
+
+    固定锚点 = 窗口两侧能覆盖边界的现有观测（from 之前最近一次、to 之后最近一次）
+    加上窗口内全部观测；禁排时段先规范化合并（边界允许排期），在其开区间之外
+    生成数量最少的新增时点，使相邻锚点间隔不超过 max_gap；多个最少方案并列时
+    取字典序最早的一组。缺少覆盖边界的现有锚点或约束无解时抛冲突异常。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not max_gap > 0:  # 同时拒绝 NaN
+        raise InvalidMaxGapError(f"max_gap ({max_gap}) must be positive")
+    for s, e in blackout:
+        if s > e:
+            raise InvalidWindowError(f"blackout interval from ({s}) must not exceed to ({e})")
+    merged = calibration.merge_intervals(blackout)
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，规划不落库
+        left = conn.execute(
+            "SELECT id, ts FROM observations WHERE ts <= ? ORDER BY ts DESC LIMIT 1", (frm,)
+        ).fetchone()
+        if left is None:
+            raise InsufficientAnchorsError(
+                f"no existing observation at or before from ({frm}) to anchor the window start"
+            )
+        right = conn.execute(
+            "SELECT id, ts FROM observations WHERE ts >= ? ORDER BY ts ASC LIMIT 1", (to,)
+        ).fetchone()
+        if right is None:
+            raise InsufficientAnchorsError(
+                f"no existing observation at or after to ({to}) to anchor the window end"
+            )
+        inside = conn.execute(
+            "SELECT id, ts FROM observations WHERE ts > ? AND ts < ? ORDER BY ts", (frm, to)
+        ).fetchall()
+    anchors = [left, *inside, right]
+    suggested = calibration.plan_calibrations([a["ts"] for a in anchors], max_gap, merged)
+    if suggested is None:
+        raise ScheduleInfeasibleError(
+            f"no feasible calibration schedule within max_gap ({max_gap}): "
+            "blackout intervals leave no room for the required calibration points"
+        )
+    # 固定锚点与建议时点（各自升序且互不重叠）合并排序，生成逐段间隔
+    points = (
+        [(a["ts"], "fixed") for a in anchors]
+        + [(p, "suggested") for p in suggested]
+    )
+    points.sort(key=lambda p: p[0])
+    segments = [
+        {
+            "t_start": a[0],
+            "t_end": b[0],
+            "start_iso": epoch_to_iso(a[0]),
+            "end_iso": epoch_to_iso(b[0]),
+            "duration_seconds": b[0] - a[0],
+            "start_kind": a[1],
+            "end_kind": b[1],
+        }
+        for a, b in zip(points, points[1:])
+    ]
+    return {
+        "from": frm,
+        "from_iso": epoch_to_iso(frm),
+        "to": to,
+        "to_iso": epoch_to_iso(to),
+        "max_gap": max_gap,
+        "blackout": [
+            {"from": s, "from_iso": epoch_to_iso(s), "to": e, "to_iso": epoch_to_iso(e)}
+            for s, e in merged
+        ],
+        "fixed_anchors": [
+            {"observation_id": a["id"], "timestamp": a["ts"], "timestamp_iso": epoch_to_iso(a["ts"])}
+            for a in anchors
+        ],
+        "suggested": [{"timestamp": p, "timestamp_iso": epoch_to_iso(p)} for p in suggested],
+        "segments": segments,
     }
