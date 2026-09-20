@@ -8,10 +8,12 @@ from fastapi import FastAPI, HTTPException, Query
 
 from . import receipts
 from . import service
-from .calibration import CalibrationError
+from .calibration import CalibrationError, ScheduleInfeasibleError
 from .db import init_db
 from .receipt_keys import load_key_ring
 from .models import (
+    CalibrationSchedulePlanIn,
+    CalibrationSchedulePlanOut,
     CorrectionIn,
     CorrectionOut,
     DriftBudgetDepletionOut,
@@ -37,10 +39,13 @@ from .receipts import (
 from .service import (
     DuplicateTimestampError,
     InsufficientNeighborsError,
+    InvalidBlackoutError,
     InvalidBudgetError,
+    InvalidGapError,
     InvalidLimitError,
     InvalidSpreadError,
     InvalidWindowError,
+    MissingBoundaryAnchorError,
     ObservationNotFoundError,
     OutOfCoverageError,
     RevisionConflictError,
@@ -57,7 +62,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Instrument Calibration Drift Compensation API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交参考值与同一时点至少 3 次读数，服务标记异常读数并计算校准偏差；"
         "在相邻观测时点间线性插值偏差，对待校正读数施加补偿。"
@@ -291,4 +296,30 @@ def get_drift_stability_window(
     try:
         return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
     except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/calibration-schedules/plan", response_model=CalibrationSchedulePlanOut)
+def post_calibration_schedule_plan(payload: CalibrationSchedulePlanIn) -> dict:
+    """规划窗口内数量最少的新增校准时点，使规划链相邻锚点间隔不超过 max_gap。
+
+    以窗口两侧能覆盖边界（ts <= from 的最近观测、ts >= to 的最近观测）的现有观测
+    及窗口内观测为固定锚点；禁排时段先规范化合并（端点相接不合并，边界允许排期），
+    在其内部之外新增时点。每段锚点间隔独立贪心：从右向左把最右侧新增点放在仍能在
+    max_gap 内接住右侧锚点的最早可排位置（时间反演下即标准最右覆盖贪心，点数最少；
+    最右点取最少方案中的最早者，递推得字典序最早方案）。响应返回固定锚点、建议
+    时点、规范化后的禁排时段与每段间隔。规划只读，不写观测、区间或修订历史。
+    from >= to、max_gap <= 0 或禁排 start > end 返回 400；缺少覆盖任一边界的
+    现有锚点或约束无解返回 409。
+    """
+    try:
+        return service.calibration_schedule_plan(
+            frm=payload.from_,
+            to=payload.to,
+            max_gap=payload.max_gap,
+            blackouts=[(b.start, b.end) for b in payload.blackouts],
+        )
+    except (MissingBoundaryAnchorError, ScheduleInfeasibleError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (InvalidWindowError, InvalidGapError, InvalidBlackoutError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

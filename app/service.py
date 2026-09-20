@@ -58,6 +58,18 @@ class InsufficientNeighborsError(Exception):
     """候选时点两侧无法同时找到已有观测，无法形成插入预演所需的双侧邻点。"""
 
 
+class InvalidGapError(Exception):
+    """max_gap 不是正数。"""
+
+
+class InvalidBlackoutError(Exception):
+    """禁排时段下界大于上界。"""
+
+
+class MissingBoundaryAnchorError(Exception):
+    """窗口两侧缺少能覆盖边界的现有观测，无法把规划锚定在覆盖范围内。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -795,4 +807,98 @@ def observation_impact_preview(
             }
             for s, e in exceedances
         ],
+    }
+
+
+# ---------- 校准排期规划 ----------
+
+def calibration_schedule_plan(
+    frm: float, to: float, max_gap: float, blackouts: list[tuple[float, float]] | None = None
+) -> dict:
+    """在窗口 [frm, to] 内规划数量最少的新增校准时点。
+
+    以窗口两侧能覆盖边界的现有观测（ts <= frm 的最近者、ts >= to 的最近者）及
+    窗口内的全部观测为固定锚点，在规范化合并后的禁排时段之外新增时点，使规划链上
+    相邻锚点间隔均不超过 max_gap。禁排区间端点与窗口边界允许排期。规划只读：
+    连接置为 query_only，绝不写观测、区间或修订历史。缺覆盖边界的锚点或约束无解
+    时抛出 MissingBoundaryAnchorError / ScheduleInfeasibleError（路由层返回 409）。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not max_gap > 0:  # 同时拒绝 NaN
+        raise InvalidGapError(f"max_gap ({max_gap}) must be positive")
+    raw_blackouts = list(blackouts or [])
+    if any(not a <= b for a, b in raw_blackouts):
+        raise InvalidBlackoutError("each blackout must satisfy start <= end")
+    # 先全局规范化合并（保持端点相接区间的边界可排）；裁剪到窗口的副本仅用于响应展示。
+    # 规划本身传入未裁剪的完整禁排：由 free_segments 与各段可排域自然求交——
+    # 若禁排从窗口外延伸、越过窗口边界，则该边界点严格位于禁排内部，绝不能因
+    # 裁剪产生的“伪端点”而被误判为可排。
+    merged = calibration.normalize_blackouts(raw_blackouts)
+    window_blackouts = [
+        (max(frm, a), min(to, b)) for a, b in merged if b > frm and a < to
+    ]
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，规划不落库
+        left = conn.execute(
+            "SELECT id, ts, bias FROM observations WHERE ts <= ? ORDER BY ts DESC LIMIT 1", (frm,)
+        ).fetchone()
+        right = conn.execute(
+            "SELECT id, ts, bias FROM observations WHERE ts >= ? ORDER BY ts ASC LIMIT 1", (to,)
+        ).fetchone()
+        if left is None or right is None:
+            raise MissingBoundaryAnchorError(
+                f"cannot plan calibration schedule over [{frm}, {to}]: existing observations "
+                "must cover both window boundaries (one at or before from and one at or after to)"
+            )
+        rows = conn.execute(
+            "SELECT id, ts, bias FROM observations WHERE ts BETWEEN ? AND ? ORDER BY ts",
+            (left["ts"], right["ts"]),
+        ).fetchall()
+    anchors = [(row["ts"], row["id"]) for row in rows]
+
+    suggestions: list[float] = []
+    segments_out: list[dict] = []
+    for (a, _id_a), (b, _id_b) in zip(anchors, anchors[1:]):
+        # 首段可排域从 frm 起（外部锚点与 frm 之间不得新增），末段止于 to
+        lo = frm if a <= frm < b else None
+        hi = to if a < to <= b else None
+        points = calibration.plan_gap_points(a, b, max_gap, merged, lo, hi)
+        suggestions.extend(points)
+        chain = [a, *points, b]
+        for s, e in zip(chain, chain[1:]):
+            gap = e - s
+            segments_out.append({
+                "t_start": s,
+                "t_end": e,
+                "start_iso": epoch_to_iso(s),
+                "end_iso": epoch_to_iso(e),
+                "gap_seconds": gap,
+                "within_max_gap": calibration.within_gap(gap, max_gap),
+            })
+
+    anchor_dicts = [
+        {
+            "observation_id": obs_id,
+            "timestamp": ts,
+            "timestamp_iso": epoch_to_iso(ts),
+            "in_window": frm <= ts <= to,
+        }
+        for ts, obs_id in anchors
+    ]
+    return {
+        "from": frm,
+        "from_iso": epoch_to_iso(frm),
+        "to": to,
+        "to_iso": epoch_to_iso(to),
+        "max_gap": max_gap,
+        "blackouts": [
+            {"t_start": a, "t_end": b, "start_iso": epoch_to_iso(a), "end_iso": epoch_to_iso(b)}
+            for a, b in window_blackouts
+        ],
+        "fixed_anchors": anchor_dicts,
+        "suggestions": [
+            {"timestamp": t, "timestamp_iso": epoch_to_iso(t)} for t in suggestions
+        ],
+        "segments": segments_out,
     }

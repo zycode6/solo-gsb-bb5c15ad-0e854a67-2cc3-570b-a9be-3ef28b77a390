@@ -1,4 +1,4 @@
-"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解、预算累积反解与稳定窗口求解。不触碰数据库，便于单测。"""
+"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解、预算累积反解、稳定窗口求解、校准排期规划。不触碰数据库，便于单测。"""
 from __future__ import annotations
 
 import math
@@ -7,6 +7,23 @@ from statistics import median
 
 class CalibrationError(ValueError):
     """输入读数无法计算有效校准偏差时抛出。"""
+
+
+class ScheduleInfeasibleError(ValueError):
+    """禁排约束下无法用新增校准时点把相邻锚点间隔压到 max_gap 以内。"""
+
+
+_EPS = 1e-9
+
+
+def _tol(*xs: float) -> float:
+    """按量级缩放的浮点比较容差。"""
+    return _EPS * max([1.0, *(abs(x) for x in xs)])
+
+
+def within_gap(gap: float, max_gap: float) -> bool:
+    """相邻锚点间隔是否不超过 max_gap（含量级缩放的浮点容差）。"""
+    return gap <= max_gap + _tol(gap, max_gap)
 
 
 def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list[float], list[float]]:
@@ -255,3 +272,105 @@ def stability_window(points: list[tuple[float, float]], spread: float) -> tuple[
     extrema = [_value_at(points, s), _value_at(points, e)]
     extrema += [b for t, b in points if s < t < e]
     return s, e, min(extrema), max(extrema)
+
+
+# ---------- 校准排期规划（固定锚点 + 禁排时段） ----------
+
+def normalize_blackouts(blackouts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """规范化并合并禁排时段：丢弃零长时段，按起点排序后合并严格相交/重叠的区间。
+
+    仅端点相接的两个时段（如 [a, b] 与 [b, c]）保持独立：它们的公共点 b 不在
+    任一时段的内部，边界允许排期，故 b 必须保持可排。输入须为 a <= b 的区间。
+    """
+    ordered = sorted((a, b) for a, b in blackouts if b > a)
+    merged: list[list[float]] = []
+    for a, b in ordered:
+        if merged and a < merged[-1][1]:  # 严格相交才合并；端点相接保留边界可排点
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def free_segments(lo: float, hi: float, blackouts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """返回 [lo, hi] 去掉禁排区间内部后剩余的可排闭区间（按起点排序，允许零长）。
+
+    禁排区间取开区间语义：只有严格落在禁排区间内部（a < t < b）的点不可排，
+    禁排端点与窗口边界均可排。当边界点与左右剩余区间都不相邻时（禁排从窗口
+    边界开始、或两个禁排仅端点相接），以零长区间 [x, x] 保留这个孤立可排点。
+    blackouts 应为已规范化合并的区间；与 [lo, hi] 的端点比较带量级容差，避免
+    窗口裁剪后的浮点噪声把本应可排的边界点误判进禁排内部。
+    """
+    if not lo <= hi + _tol(lo, hi):
+        return []
+    segments: list[tuple[float, float]] = []
+    cursor = lo
+    for a, b in blackouts:
+        if b <= lo + _tol(b, lo) or a >= hi - _tol(a, hi):
+            continue                       # 与 [lo, hi] 仅端点相接或完全在外
+        if abs(a - cursor) <= _tol(a, cursor):
+            # 禁排从窗口边界或上一禁排终点开始：公共端点是孤立可排点
+            segments.append((cursor, cursor))
+        elif a > cursor:
+            segments.append((cursor, a))   # [cursor, a] 均可排（a 是禁排端点，保留）
+        cursor = b
+    if cursor < hi - _tol(cursor, hi):
+        segments.append((cursor, hi))
+    elif abs(cursor - hi) <= _tol(cursor, hi):
+        if not (segments and abs(segments[-1][1] - hi) <= _tol(segments[-1][1], hi)):
+            segments.append((hi, hi))      # 最后一个禁排恰止于 hi：hi 是孤立可排点
+    return segments
+
+
+def _earliest_within(segments: list[tuple[float, float]], lo: float, hi: float) -> float | None:
+    """可排域中属于 [lo, hi] 的最早点；不存在则 None。"""
+    for a, b in segments:
+        if b < lo - _tol(b, lo):
+            continue
+        if a > hi + _tol(a, hi):
+            break
+        candidate = max(a, lo)
+        if candidate <= hi + _tol(candidate, hi):
+            return min(candidate, hi)
+    return None
+
+
+def plan_gap_points(
+    a: float,
+    b: float,
+    max_gap: float,
+    blackouts: list[tuple[float, float]],
+    lo: float | None = None,
+    hi: float | None = None,
+) -> list[float]:
+    """在固定锚点 a、b 之间规划数量最少的新增时点，使相邻锚点间隔 <= max_gap。
+
+    新增点必须严格位于 a、b 之间，落在可排域（[lo, hi] 与禁排区间内部之差）内，
+    禁排端点与域边界允许排期。blackouts 为已规范化合并的禁排区间，允许延伸到
+    [lo, hi] 之外（由 free_segments 自然求交：越过域边界的禁排会使该边界点
+    成为禁排内部而不可排，恰止于边界的则保留边界可排）；lo/hi 用于把可排域裁剪
+    到规划窗口（首段从 from 起、末段止于 to）。数量最少的方案并列时，
+    返回时点序列字典序最早（整体最靠左）的一组；无解抛 ScheduleInfeasibleError。
+
+    采用从右向左的贪心：每步把最右侧新增点放在“仍能在 max_gap 内接住右侧锚点”
+    的最早可排位置。时间反演后即标准的最右覆盖贪心，故新增点数最少；而最右点
+    取所有最少方案中最早者（交换论证：任何最少方案的最右点不早于该值，替换后
+    不增加点数且序列不更晚），逐点递推即得字典序最早方案。
+    """
+    domain_lo = a if lo is None else max(a, lo)
+    domain_hi = b if hi is None else min(b, hi)
+    segments = free_segments(domain_lo, domain_hi, blackouts)
+    chosen: list[float] = []
+    right = b
+    while right - a > max_gap + _tol(a, right, max_gap):
+        # 下一个点必须落在 [right-max_gap, right) 内；取最早可排位置
+        q = _earliest_within(segments, right - max_gap, right)
+        if q is None or q >= right - _tol(q, right) or q <= a + _tol(a, q):
+            raise ScheduleInfeasibleError(
+                f"no schedulable calibration point can bridge anchors {a} and {b} "
+                f"under max_gap {max_gap}"
+            )
+        chosen.append(q)
+        right = q
+    chosen.reverse()
+    return chosen

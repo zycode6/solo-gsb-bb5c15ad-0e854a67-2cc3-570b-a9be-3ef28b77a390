@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 
 def epoch_to_iso(ts: float) -> str:
@@ -60,6 +60,23 @@ class ObservationReviseIn(ObservationIn):
 
 class ObservationImpactPreviewIn(ObservationIn):
     impact_limit: float = Field(description="影响阈值（正数）：|偏差变化| 严格大于该值才计入影响区间")
+
+
+class BlackoutIn(BaseModel):
+    start: Timestamp = Field(description="禁排时段起点（含端点，端点本身仍可排）：Unix 秒或 ISO 8601")
+    end: Timestamp = Field(description="禁排时段终点（含端点，端点本身仍可排）：Unix 秒或 ISO 8601")
+
+
+class CalibrationSchedulePlanIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: Timestamp = Field(alias="from", description="规划窗口下界：Unix 秒或 ISO 8601")
+    to: Timestamp = Field(description="规划窗口上界：Unix 秒或 ISO 8601")
+    max_gap: float = Field(description="相邻锚点允许的最大间隔秒数（正数）")
+    blackouts: list[BlackoutIn] = Field(
+        default_factory=list,
+        description="禁排时段（可选）：新增时点不得落在其内部，时段端点允许排期；提交后先规范化合并",
+    )
 
 
 # ---------- 响应 ----------
@@ -251,4 +268,54 @@ class ObservationImpactPreviewOut(BaseModel):
     max_change_at_iso: str
     impact_intervals: list[ImpactIntervalOut] = Field(
         description="|偏差变化| > impact_limit 的连续区间，按时间排序；阈值交点解析求解"
+    )
+
+
+# ---------- 校准排期规划 ----------
+
+class ScheduleAnchorOut(BaseModel):
+    observation_id: int = Field(description="固定锚点对应的现有观测 ID")
+    timestamp: float = Field(description="锚点时点（Unix 秒）")
+    timestamp_iso: str
+    in_window: bool = Field(description="是否落在规划窗口 [from, to] 内；两侧覆盖边界的外部锚点为 false")
+
+
+class ScheduleSuggestionOut(BaseModel):
+    timestamp: float = Field(description="建议新增的校准时点（Unix 秒）：禁排时段之外、数量最少且字典序最早")
+    timestamp_iso: str
+
+
+class ScheduleBlackoutOut(BaseModel):
+    t_start: float = Field(description="规范化合并并裁剪到窗口后的禁排时段起点（Unix 秒）")
+    t_end: float = Field(description="规范化合并并裁剪到窗口后的禁排时段终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+
+
+class ScheduleSegmentOut(BaseModel):
+    t_start: float = Field(description="规划链上相邻两锚点（固定锚点或建议时点）的起点（Unix 秒）")
+    t_end: float = Field(description="规划链上相邻两锚点（固定锚点或建议时点）的终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+    gap_seconds: float = Field(description="该段间隔秒数（t_end − t_start）")
+    within_max_gap: bool = Field(description="该段间隔是否不超过 max_gap（规划结果应全部为 true）")
+
+
+class CalibrationSchedulePlanOut(BaseModel):
+    from_: float = Field(alias="from", description="规划窗口下界（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="规划窗口上界（Unix 秒）")
+    to_iso: str
+    max_gap: float = Field(description="相邻锚点允许的最大间隔秒数")
+    blackouts: list[ScheduleBlackoutOut] = Field(
+        description="规范化合并并裁剪到规划窗口后的禁排时段，按时间排序"
+    )
+    fixed_anchors: list[ScheduleAnchorOut] = Field(
+        description="固定锚点：窗口两侧覆盖边界的现有观测与窗口内现有观测，按时间排序"
+    )
+    suggestions: list[ScheduleSuggestionOut] = Field(
+        description="建议新增的校准时点，按时间排序；数量最少，并列时字典序最早"
+    )
+    segments: list[ScheduleSegmentOut] = Field(
+        description="固定锚点与建议时点构成的规划链上每一段间隔，按时间排序"
     )
